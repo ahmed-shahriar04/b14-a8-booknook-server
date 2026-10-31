@@ -1,6 +1,11 @@
-# BookNook Backend API (Express.js + MongoDB + JWT)
+# 📚 BookNook Backend API (Express.js + MongoDB + JWT)
 
-RESTful API backend for BookNook library web application.
+> **Server Repository**: [https://github.com/ahmed-shahriar04/b14-a8-booknook-server](https://github.com/ahmed-shahriar04/b14-a8-booknook-server)  
+> **Client Repository**: [https://github.com/ahmed-shahriar04/b14-a8-booknook-client](https://github.com/ahmed-shahriar04/b14-a8-booknook-client)  
+> **Live Client**: [https://booknooktoday.vercel.app](https://booknooktoday.vercel.app)  
+> **Author**: [Shahriar Ahmed Riaz](https://shahriarahmedriaz.netlify.app/)
+
+RESTful API backend for BookNook library web application built strictly with pure JavaScript ES modules.
 
 ## Endpoints Implemented
 
