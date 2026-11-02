@@ -1,7 +1,11 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { MongoClient, ServerApiVersion, ObjectId } from 'mongodb';
+import { ObjectId } from 'mongodb';
+import { connectDB, getCollections } from './config/db.js';
+import { checkAndSeedDatabase } from './utils/seedBooks.js';
+import { validateBookInput, validateBorrowInput, isValidObjectId } from './utils/validators.js';
+import { notFoundHandler, globalErrorHandler } from './middleware/errorHandler.js';
 import { verifyJWT } from './middleware/verifyJWT.js';
 
 dotenv.config();
@@ -19,7 +23,7 @@ const allowedOrigins = [
 // Middlewares - Permissive CORS with credentials support
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps or curl) or matching origins
+    // Allow requests with no origin (like mobile apps, curl, or server-side fetch) or matching origins
     if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
       callback(null, true);
     } else {
@@ -34,42 +38,27 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json());
 
-const uri = process.env.MONGODB_URI;
+// Initialize MongoDB pooled connection and auto-seed initial books if empty
+connectDB()
+  .then(async ({ booksCollection }) => {
+    await checkAndSeedDatabase(booksCollection);
+  })
+  .catch((err) => {
+    console.error('Failed to initialize MongoDB connection:', err.message);
+  });
 
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  }
-});
-
-let db, booksCollection, borrowsCollection;
-let isConnecting = false;
-
-async function connectDB() {
-  if (db && booksCollection) return;
-  if (isConnecting) return;
-  isConnecting = true;
-  try {
-    await client.connect();
-    db = client.db('booknook');
-    booksCollection = db.collection('books');
-    borrowsCollection = db.collection('borrows');
-    console.log("Successfully connected to MongoDB Atlas!");
-  } catch (error) {
-    console.error("MongoDB Atlas connection error:", error);
-  } finally {
-    isConnecting = false;
-  }
-}
-
-connectDB();
-
-// Ensure active DB connection for all incoming requests (avoids cold 503)
+// Ensure active DB connection for all incoming requests (eliminates cold start 503s)
 app.use(async (req, res, next) => {
+  const { booksCollection } = getCollections();
   if (!booksCollection) {
-    await connectDB();
+    try {
+      await connectDB();
+    } catch (err) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection is waking up. Please retry in a few seconds.',
+      });
+    }
   }
   next();
 });
@@ -81,7 +70,7 @@ app.get('/', (req, res) => {
   res.status(200).json({
     status: 'active',
     server: 'BookNook Library Express API Server',
-    version: '1.2.0',
+    version: '1.3.0',
     documentation: 'https://github.com/ahmed-shahriar04/b14-a8-booknook-server#readme',
     timestamp: new Date().toISOString(),
   });
@@ -89,6 +78,7 @@ app.get('/', (req, res) => {
 
 app.get('/health', async (req, res) => {
   try {
+    const { db } = getCollections();
     const isConnected = !!db;
     res.status(200).json({
       status: 'healthy',
@@ -104,8 +94,9 @@ app.get('/health', async (req, res) => {
 // -------------------------------------------------------------
 // 1. GET /stats — Global Library Statistics (Public)
 // -------------------------------------------------------------
-app.get('/stats', async (req, res) => {
+app.get('/stats', async (req, res, next) => {
   try {
+    const { booksCollection, borrowsCollection } = getCollections();
     if (!booksCollection || !borrowsCollection) {
       return res.status(503).json({ success: false, message: 'Database connecting...' });
     }
@@ -126,16 +117,16 @@ app.get('/stats', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Error fetching stats:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch statistics', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // GET /authors — Get all unique authors dynamically from database (Public)
 // -------------------------------------------------------------
-app.get('/authors', async (req, res) => {
+app.get('/authors', async (req, res, next) => {
   try {
+    const { booksCollection } = getCollections();
     if (!booksCollection) {
       return res.status(503).json({ success: false, message: 'Database connecting...' });
     }
@@ -148,8 +139,7 @@ app.get('/authors', async (req, res) => {
 
     res.status(200).json({ success: true, count: cleanAuthors.length, data: cleanAuthors });
   } catch (error) {
-    console.error('Error fetching authors:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch authors', error: error.message });
+    next(error);
   }
 });
 
@@ -157,8 +147,9 @@ app.get('/authors', async (req, res) => {
 // 2. GET /books — Get all books (Public)
 // Supports: ?category, ?search, ?userEmail, ?limit, ?sort
 // -------------------------------------------------------------
-app.get('/books', async (req, res) => {
+app.get('/books', async (req, res, next) => {
   try {
+    const { booksCollection } = getCollections();
     if (!booksCollection) {
       return res.status(503).json({ success: false, message: 'Database connecting...' });
     }
@@ -189,27 +180,27 @@ app.get('/books', async (req, res) => {
     }
 
     if (limit) {
-      cursor = cursor.limit(parseInt(limit));
+      cursor = cursor.limit(parseInt(limit, 10));
     }
 
     const books = await cursor.toArray();
     res.status(200).json({ success: true, count: books.length, data: books });
   } catch (error) {
-    console.error('Error fetching books:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch books', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 3. GET /books/:id — Get single book details (Public)
 // -------------------------------------------------------------
-app.get('/books/:id', async (req, res) => {
+app.get('/books/:id', async (req, res, next) => {
   try {
     const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: 'Invalid Book ID format' });
     }
 
+    const { booksCollection } = getCollections();
     const book = await booksCollection.findOne({ _id: new ObjectId(id) });
     if (!book) {
       return res.status(404).json({ success: false, message: 'Book not found' });
@@ -217,33 +208,26 @@ app.get('/books/:id', async (req, res) => {
 
     res.status(200).json({ success: true, data: book });
   } catch (error) {
-    console.error('Error fetching book details:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch book details', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 4. POST /books — Add a book (Private Route, verifyJWT)
 // -------------------------------------------------------------
-app.post('/books', verifyJWT, async (req, res) => {
+app.post('/books', verifyJWT, async (req, res, next) => {
   try {
-    const { title, author, category, image, description, totalCopies } = req.body;
+    const validation = validateBookInput(req.body);
+    if (!validation.isValid) {
+      return res.status(400).json({ success: false, message: validation.error });
+    }
+
+    const { booksCollection } = getCollections();
     const userEmail = req.user.email;
     const userName = req.user.name || 'Anonymous Reader';
 
-    if (!title || !author || !category || !image || !description) {
-      return res.status(400).json({ success: false, message: 'All book fields are required' });
-    }
-
-    const parsedCopies = parseInt(totalCopies) >= 0 ? parseInt(totalCopies) : 1;
-
     const newBook = {
-      title: title.trim(),
-      author: author.trim(),
-      category: category.trim(),
-      image: image.trim(),
-      description: description.trim(),
-      totalCopies: parsedCopies,
+      ...validation.sanitized,
       userEmail,
       userName,
       createdAt: new Date(),
@@ -258,49 +242,51 @@ app.post('/books', verifyJWT, async (req, res) => {
       data: newBook,
     });
   } catch (error) {
-    console.error('Error adding book:', error);
-    res.status(500).json({ success: false, message: 'Failed to add book', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 5. PATCH /books/:id — Update a book (Private Route, verifyJWT)
 // -------------------------------------------------------------
-app.patch('/books/:id', verifyJWT, async (req, res) => {
+app.patch('/books/:id', verifyJWT, async (req, res, next) => {
   try {
     const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: 'Invalid Book ID' });
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid Book ID format' });
     }
 
-    // Verify ownership
+    const { booksCollection } = getCollections();
     const book = await booksCollection.findOne({ _id: new ObjectId(id) });
     if (!book) {
       return res.status(404).json({ success: false, message: 'Book not found' });
     }
 
+    // Verify ownership
     if (book.userEmail !== req.user.email) {
       return res.status(403).json({ success: false, message: 'Forbidden: You can only edit books added by you.' });
     }
 
-    const { title, author, category, image, description, totalCopies } = req.body;
+    const validation = validateBookInput(req.body, true);
+    if (!validation.isValid) {
+      return res.status(400).json({ success: false, message: validation.error });
+    }
+
     const updateDoc = {
       $set: {
-        ...(title && { title: title.trim() }),
-        ...(author && { author: author.trim() }),
-        ...(category && { category: category.trim() }),
-        ...(image && { image: image.trim() }),
-        ...(description && { description: description.trim() }),
-        ...(totalCopies !== undefined && { totalCopies: parseInt(totalCopies) }),
+        ...validation.sanitized,
         updatedAt: new Date(),
-      }
+      },
     };
 
     const result = await booksCollection.updateOne({ _id: new ObjectId(id) }, updateDoc);
-    res.status(200).json({ success: true, message: 'Book updated successfully', modifiedCount: result.modifiedCount });
+    res.status(200).json({
+      success: true,
+      message: 'Book updated successfully',
+      modifiedCount: result.modifiedCount,
+    });
   } catch (error) {
-    console.error('Error updating book:', error);
-    res.status(500).json({ success: false, message: 'Failed to update book', error: error.message });
+    next(error);
   }
 });
 
@@ -308,19 +294,20 @@ app.patch('/books/:id', verifyJWT, async (req, res) => {
 // 6. DELETE /books/:id — Delete a book (Private Route, verifyJWT)
 // With Active Loan Protection
 // -------------------------------------------------------------
-app.delete('/books/:id', verifyJWT, async (req, res) => {
+app.delete('/books/:id', verifyJWT, async (req, res, next) => {
   try {
     const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: 'Invalid Book ID' });
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid Book ID format' });
     }
 
-    // Verify ownership
+    const { booksCollection, borrowsCollection } = getCollections();
     const book = await booksCollection.findOne({ _id: new ObjectId(id) });
     if (!book) {
       return res.status(404).json({ success: false, message: 'Book not found' });
     }
 
+    // Verify ownership
     if (book.userEmail !== req.user.email) {
       return res.status(403).json({ success: false, message: 'Forbidden: You can only delete books added by you.' });
     }
@@ -337,22 +324,22 @@ app.delete('/books/:id', verifyJWT, async (req, res) => {
     const result = await booksCollection.deleteOne({ _id: new ObjectId(id) });
     res.status(200).json({ success: true, message: 'Book deleted successfully', deletedCount: result.deletedCount });
   } catch (error) {
-    console.error('Error deleting book:', error);
-    res.status(500).json({ success: false, message: 'Failed to delete book', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 7. POST /borrows — Borrow a book (Private Route, verifyJWT)
 // -------------------------------------------------------------
-app.post('/borrows', verifyJWT, async (req, res) => {
+app.post('/borrows', verifyJWT, async (req, res, next) => {
   try {
+    const { booksCollection, borrowsCollection } = getCollections();
     const { bookId, returnDate } = req.body;
     const userEmail = req.user.email;
     const userName = req.user.name || 'Anonymous Reader';
 
-    if (!bookId || !ObjectId.isValid(bookId)) {
-      return res.status(400).json({ success: false, message: 'Valid Book ID is required' });
+    if (!isValidObjectId(bookId)) {
+      return res.status(400).json({ success: false, message: 'A valid 24-character Book ID is required.' });
     }
 
     // 1. Fetch book details
@@ -379,13 +366,17 @@ app.post('/borrows', verifyJWT, async (req, res) => {
       });
     }
 
-    // 4. Decrease available totalCopies by 1 using $inc
+    // 4. Decrease available totalCopies by 1 using atomic $inc
     await booksCollection.updateOne(
       { _id: new ObjectId(bookId) },
       { $inc: { totalCopies: -1 } }
     );
 
     // 5. Save record in borrows collection
+    const parsedReturnDate = returnDate && !isNaN(new Date(returnDate).getTime())
+      ? new Date(returnDate)
+      : new Date(Date.now() + 14 * 24 * 60 * 60 * 1000); // Default 14 days
+
     const borrowRecord = {
       bookId: new ObjectId(bookId),
       bookTitle: book.title,
@@ -393,7 +384,7 @@ app.post('/borrows', verifyJWT, async (req, res) => {
       userEmail,
       userName,
       borrowDate: new Date(),
-      returnDate: returnDate ? new Date(returnDate) : new Date(Date.now() + 14 * 24 * 60 * 60 * 1000), // Default 14 days
+      returnDate: parsedReturnDate,
     };
 
     const result = await borrowsCollection.insertOne(borrowRecord);
@@ -404,16 +395,16 @@ app.post('/borrows', verifyJWT, async (req, res) => {
       data: borrowRecord,
     });
   } catch (error) {
-    console.error('Error borrowing book:', error);
-    res.status(500).json({ success: false, message: 'Failed to borrow book', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 8. GET /borrows — Get borrows of the logged in user (Private Route, verifyJWT)
 // -------------------------------------------------------------
-app.get('/borrows', verifyJWT, async (req, res) => {
+app.get('/borrows', verifyJWT, async (req, res, next) => {
   try {
+    const { borrowsCollection } = getCollections();
     const userEmail = req.user.email;
     const userBorrows = await borrowsCollection
       .find({ userEmail })
@@ -422,21 +413,21 @@ app.get('/borrows', verifyJWT, async (req, res) => {
 
     res.status(200).json({ success: true, count: userBorrows.length, data: userBorrows });
   } catch (error) {
-    console.error('Error fetching user borrows:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch your borrows', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 9. GET /borrows/check/:bookId — Check if user already borrowed a book
 // -------------------------------------------------------------
-app.get('/borrows/check/:bookId', verifyJWT, async (req, res) => {
+app.get('/borrows/check/:bookId', verifyJWT, async (req, res, next) => {
   try {
     const { bookId } = req.params;
-    if (!ObjectId.isValid(bookId)) {
+    if (!isValidObjectId(bookId)) {
       return res.status(400).json({ success: false, message: 'Invalid Book ID' });
     }
 
+    const { borrowsCollection } = getCollections();
     const existing = await borrowsCollection.findOne({
       bookId: new ObjectId(bookId),
       userEmail: req.user.email,
@@ -448,21 +439,21 @@ app.get('/borrows/check/:bookId', verifyJWT, async (req, res) => {
       borrowRecord: existing || null,
     });
   } catch (error) {
-    console.error('Error checking borrow status:', error);
-    res.status(500).json({ success: false, message: 'Failed to check borrow status', error: error.message });
+    next(error);
   }
 });
 
 // -------------------------------------------------------------
 // 10. DELETE /borrows/:id — Return a book (Private Route, verifyJWT)
 // -------------------------------------------------------------
-app.delete('/borrows/:id', verifyJWT, async (req, res) => {
+app.delete('/borrows/:id', verifyJWT, async (req, res, next) => {
   try {
     const borrowId = req.params.id;
-    if (!ObjectId.isValid(borrowId)) {
+    if (!isValidObjectId(borrowId)) {
       return res.status(400).json({ success: false, message: 'Invalid Borrow ID' });
     }
 
+    const { booksCollection, borrowsCollection } = getCollections();
     const borrowRecord = await borrowsCollection.findOne({ _id: new ObjectId(borrowId) });
     if (!borrowRecord) {
       return res.status(404).json({ success: false, message: 'Borrow record not found' });
@@ -478,20 +469,28 @@ app.delete('/borrows/:id', verifyJWT, async (req, res) => {
 
     // 2. Increase totalCopies by 1 ($inc: +1)
     if (borrowRecord.bookId) {
+      const bId = ObjectId.isValid(borrowRecord.bookId)
+        ? new ObjectId(borrowRecord.bookId)
+        : borrowRecord.bookId;
       await booksCollection.updateOne(
-        { _id: new ObjectId(borrowRecord.bookId) },
+        { _id: bId },
         { $inc: { totalCopies: 1 } }
       );
     }
 
     res.status(200).json({ success: true, message: 'Book returned successfully!' });
   } catch (error) {
-    console.error('Error returning book:', error);
-    res.status(500).json({ success: false, message: 'Failed to return book', error: error.message });
+    next(error);
   }
 });
 
+// -------------------------------------------------------------
+// Unhandled 404 Route & Global Error Handling Middlewares
+// -------------------------------------------------------------
+app.use(notFoundHandler);
+app.use(globalErrorHandler);
+
 // Start Express Server
 app.listen(port, () => {
-  console.log(`BookNook server running on port: ${port}`);
+  console.log(`🚀 BookNook server running on port: ${port}`);
 });
