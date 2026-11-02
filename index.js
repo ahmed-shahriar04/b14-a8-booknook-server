@@ -45,21 +45,34 @@ const client = new MongoClient(uri, {
 });
 
 let db, booksCollection, borrowsCollection;
+let isConnecting = false;
 
 async function connectDB() {
+  if (db && booksCollection) return;
+  if (isConnecting) return;
+  isConnecting = true;
   try {
     await client.connect();
-    console.log("Successfully connected to MongoDB Atlas!");
-
     db = client.db('booknook');
     booksCollection = db.collection('books');
     borrowsCollection = db.collection('borrows');
+    console.log("Successfully connected to MongoDB Atlas!");
   } catch (error) {
     console.error("MongoDB Atlas connection error:", error);
+  } finally {
+    isConnecting = false;
   }
 }
 
 connectDB();
+
+// Ensure active DB connection for all incoming requests (avoids cold 503)
+app.use(async (req, res, next) => {
+  if (!booksCollection) {
+    await connectDB();
+  }
+  next();
+});
 
 // -------------------------------------------------------------
 // Root & Healthcheck Routes
