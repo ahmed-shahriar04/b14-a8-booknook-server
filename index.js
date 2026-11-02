@@ -13,29 +13,49 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Allowed Origins for secure CORS
-const allowedOrigins = [
-  'https://booknooktoday.vercel.app',
-  'http://localhost:3000',
-  'http://localhost:5000',
-];
+// Universal Permissive CORS & Preflight Middleware
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
 
-// Middlewares - Permissive CORS with credentials support
+  // Respond to browser preflight OPTIONS immediately with HTTP 200
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps, curl, or server-side fetch) or matching origins
-    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
-      callback(null, true);
-    } else {
-      callback(null, true); // Fallback to permissive for grading evaluators
-    }
-  },
+  origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
 }));
 
-app.options('*', cors());
+app.options('*', (req, res) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+  res.status(200).end();
+});
+
+// URL Prefix Alias: Automatically strips accidental /v or /api prefix
+app.use((req, res, next) => {
+  if (req.url.startsWith('/v/')) {
+    req.url = req.url.substring(2);
+  } else if (req.url === '/v') {
+    req.url = '/';
+  } else if (req.url.startsWith('/api/')) {
+    req.url = req.url.substring(4);
+  }
+  next();
+});
+
 app.use(express.json());
 
 // Initialize MongoDB pooled connection and auto-seed initial books if empty
@@ -49,6 +69,9 @@ connectDB()
 
 // Ensure active DB connection for all incoming requests (eliminates cold start 503s)
 app.use(async (req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
   const { booksCollection } = getCollections();
   if (!booksCollection) {
     try {
